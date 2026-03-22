@@ -1,0 +1,18 @@
+[project]
+name = "teslamate-garage"
+version = "0.1.0"
+description = "Auto-open garage door based on Tesla vehicle proximity via TeslaMate MQTT"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "meross-iot>=0.4.10.4",
+    "paho-mqtt>=2.1.0",
+    "structlog>=25.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=7.1.0",
+]
