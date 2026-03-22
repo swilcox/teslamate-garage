@@ -48,6 +48,21 @@ logging.getLogger("paho").setLevel(logging.WARNING)
 
 log = structlog.get_logger()
 
+
+def load_env():
+    """Load .env file if present; otherwise rely on environment variables."""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    os.environ.setdefault(key.strip(), value.strip())
+
+
+load_env()
+
 CAR_IDS = [int(x) for x in os.environ.get("CAR_IDS", "1,2").split(",")]
 HOME_GEOFENCE = os.environ.get("HOME_GEOFENCE", "Home")
 HOME_LAT = float(os.environ.get("HOME_LAT", "37.3944"))  # Default: Tesla HQ
@@ -65,18 +80,6 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def load_env():
-    """Load .env file if present; otherwise rely on environment variables."""
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    os.environ.setdefault(key.strip(), value.strip())
 
 
 @dataclass
@@ -318,7 +321,6 @@ class GarageDoorService:
 
 
 def main():
-    load_env()
     service = GarageDoorService()
     try:
         asyncio.run(service.run())
