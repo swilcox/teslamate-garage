@@ -27,6 +27,8 @@ from meross_iot.http_api import MerossHttpClient
 from meross_iot.manager import MerossManager
 
 # Configure structlog
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -36,7 +38,7 @@ structlog.configure(
         structlog.processors.TimeStamper(fmt="%H:%M:%S", utc=False),
         structlog.dev.ConsoleRenderer(),
     ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, LOG_LEVEL, logging.INFO)),
     context_class=dict,
     logger_factory=structlog.PrintLoggerFactory(),
     cache_logger_on_first_use=True,
@@ -139,6 +141,13 @@ class GarageDoorService:
         self.initialized = False
         self.init_timer: asyncio.TimerHandle | None = None
 
+        # Heartbeat interval in seconds
+        self.heartbeat_interval = int(os.environ.get("HEARTBEAT_INTERVAL", "300"))
+        self.heartbeat_handle: asyncio.TimerHandle | None = None
+
+        # Track last MQTT message time per car for staleness detection
+        self.last_mqtt_time: dict[int, float] = {cid: 0.0 for cid in CAR_IDS}
+
     async def connect_meross(self):
         email = os.environ.get("MEROSS_EMAIL")
         password = os.environ.get("MEROSS_PASSWORD")
@@ -170,13 +179,18 @@ class GarageDoorService:
 
     async def open_door(self, reason: str):
         now = time.time()
-        if now - self.last_open_time < self.open_cooldown:
-            log.info("open_skipped", reason="open_cooldown_active", trigger=reason)
+        open_elapsed = now - self.last_open_time
+        close_elapsed = now - self.last_close_time
+        if open_elapsed < self.open_cooldown:
+            log.info("open_skipped", reason="open_cooldown_active", trigger=reason,
+                     cooldown_remaining_s=round(self.open_cooldown - open_elapsed))
             return
-        if now - self.last_close_time < self.close_cooldown:
-            log.info("open_skipped", reason="close_cooldown_active", trigger=reason)
+        if close_elapsed < self.close_cooldown:
+            log.info("open_skipped", reason="close_cooldown_active", trigger=reason,
+                     cooldown_remaining_s=round(self.close_cooldown - close_elapsed))
             return
 
+        log.info("open_checking_device_state", trigger=reason)
         await self.garage_device.async_update()
         if self.garage_device.get_is_open():
             log.info("open_skipped", reason="already_open", trigger=reason)
@@ -185,6 +199,7 @@ class GarageDoorService:
         log.info("door_opening", reason=reason)
         await self.garage_device.async_open(channel=0)
         self.last_open_time = now
+        log.info("door_opened", reason=reason)
 
     async def close_door(self, reason: str):
         await self.garage_device.async_update()
@@ -204,26 +219,54 @@ class GarageDoorService:
         log.info("door_closing", reason=reason)
         await self.garage_device.async_close(channel=0)
         self.last_close_time = time.time()
+        log.info("door_closed", reason=reason)
 
     def handle_update(self, car_id: int, metric: str, value: str):
         car = self.cars[car_id]
+        now = time.time()
+        self.last_mqtt_time[car_id] = now
+
+        old_value = getattr(car, metric, None)
 
         if metric == "geofence":
             car.prev_geofence = car.geofence
 
         setattr(car, metric, value)
 
+        # Log all state changes at INFO, position updates at DEBUG
+        if metric in ("latitude", "longitude", "heading", "speed"):
+            log.debug("mqtt_update", car=car_id, metric=metric, value=value)
+        else:
+            if old_value != value:
+                log.info("mqtt_state_change", car=car_id, metric=metric,
+                         old=old_value or "(empty)", new=value or "(empty)")
+            else:
+                log.debug("mqtt_update", car=car_id, metric=metric, value=value)
+
         # Don't act on the initial batch of retained messages
         if not self.initialized:
+            log.debug("skipping_pre_init", car=car_id, metric=metric)
             return
 
         # --- OPEN LOGIC ---
         # Trigger: position update shows car approaching home
         if metric in ("latitude", "longitude"):
             dist = car.distance_from_home()
-            if dist is not None:
-                near_home = dist <= OPEN_DISTANCE_M
-                if near_home and not car.was_near_home and car.is_driving:
+            if dist is None:
+                log.warning("position_incomplete", car=car_id,
+                            lat=car.latitude, lon=car.longitude)
+                return
+
+            near_home = dist <= OPEN_DISTANCE_M
+            log.debug("position_check", car=car_id,
+                       distance_m=round(dist),
+                       near_home=near_home,
+                       was_near_home=car.was_near_home,
+                       shift_state=car.shift_state or "(empty)",
+                       is_driving=car.is_driving)
+
+            if near_home and not car.was_near_home:
+                if car.is_driving:
                     log.info("car_approaching",
                              car=car_id,
                              distance_m=round(dist),
@@ -232,16 +275,64 @@ class GarageDoorService:
                         self.open_door(f"Car {car_id} within {dist:.0f}m of home"),
                         self.loop,
                     )
-                car.was_near_home = near_home
+                else:
+                    log.info("car_near_home_but_not_driving",
+                             car=car_id,
+                             distance_m=round(dist),
+                             shift_state=car.shift_state or "(empty)",
+                             state=car.state or "(empty)")
+            elif near_home and car.was_near_home:
+                log.debug("car_still_near_home", car=car_id,
+                          distance_m=round(dist))
+
+            car.was_near_home = near_home
 
         # --- CLOSE LOGIC ---
         # Trigger: geofence just changed away from Home (car leaving)
-        if metric == "geofence" and car.just_left_home:
-            log.info("car_leaving_home", car=car_id, new_geofence=car.geofence)
-            asyncio.run_coroutine_threadsafe(
-                self.close_door(f"Car {car_id} left {HOME_GEOFENCE}"),
-                self.loop,
-            )
+        if metric == "geofence":
+            if car.just_left_home:
+                log.info("car_leaving_home", car=car_id, new_geofence=car.geofence)
+                asyncio.run_coroutine_threadsafe(
+                    self.close_door(f"Car {car_id} left {HOME_GEOFENCE}"),
+                    self.loop,
+                )
+            elif car.geofence == HOME_GEOFENCE and car.prev_geofence != HOME_GEOFENCE:
+                log.info("car_arrived_home_geofence", car=car_id,
+                         prev_geofence=car.prev_geofence or "(empty)")
+            else:
+                log.debug("geofence_update_no_action", car=car_id,
+                          geofence=car.geofence, prev_geofence=car.prev_geofence)
+
+    def log_car_states(self, event: str = "car_state"):
+        """Log the current state of all tracked cars."""
+        for cid, car in self.cars.items():
+            dist = car.distance_from_home()
+            last_msg_ago = time.time() - self.last_mqtt_time[cid]
+            log.info(event,
+                     car=cid,
+                     geofence=car.geofence or "(empty)",
+                     state=car.state or "(empty)",
+                     shift_state=car.shift_state or "(empty)",
+                     distance_m=round(dist) if dist is not None else None,
+                     near_home=car.was_near_home,
+                     last_mqtt_s=round(last_msg_ago) if self.last_mqtt_time[cid] else None)
+
+    def heartbeat(self):
+        """Periodic status dump so we can tell the service is alive and data is flowing."""
+        self.log_car_states(event="heartbeat")
+
+        # Warn if any car hasn't sent data recently
+        now = time.time()
+        for cid in CAR_IDS:
+            last = self.last_mqtt_time[cid]
+            if last > 0 and (now - last) > self.heartbeat_interval:
+                log.warning("mqtt_data_stale", car=cid,
+                            seconds_since_last=round(now - last))
+
+        # Schedule next heartbeat
+        if self.loop:
+            self.heartbeat_handle = self.loop.call_later(
+                self.heartbeat_interval, self.heartbeat)
 
     def mark_initialized(self):
         """Called after a short delay to mark retained messages as processed."""
@@ -251,14 +342,17 @@ class GarageDoorService:
             # Set initial near-home state so we don't false-trigger
             if dist is not None:
                 car.was_near_home = dist <= OPEN_DISTANCE_M
-            log.info("car_state",
-                     car=cid,
-                     geofence=car.geofence or None,
-                     state=car.state or None,
-                     shift_state=car.shift_state or None,
-                     distance_m=round(dist) if dist is not None else None,
-                     near_home=car.was_near_home)
-        log.info("initialized")
+        self.log_car_states(event="initial_state")
+        log.info("initialized",
+                 open_distance_m=OPEN_DISTANCE_M,
+                 open_cooldown_s=OPEN_COOLDOWN,
+                 close_cooldown_s=CLOSE_COOLDOWN,
+                 heartbeat_interval_s=self.heartbeat_interval)
+
+        # Start periodic heartbeat
+        if self.loop:
+            self.heartbeat_handle = self.loop.call_later(
+                self.heartbeat_interval, self.heartbeat)
 
     def start_mqtt(self):
         topics = [
@@ -278,11 +372,18 @@ class GarageDoorService:
             # After retained messages arrive (give it 3 seconds), mark as initialized
             self.init_timer = self.loop.call_later(3.0, self.mark_initialized)
 
+        def on_disconnect(client, userdata, flags, reason_code, properties):
+            log.warning("mqtt_disconnected", reason_code=reason_code)
+
         def on_message(client, userdata, msg):
             parts = msg.topic.split("/")
             if len(parts) != 4:
+                log.debug("mqtt_unexpected_topic", topic=msg.topic)
                 return
             car_id = int(parts[2])
+            if car_id not in self.cars:
+                log.debug("mqtt_unknown_car", car_id=car_id, topic=msg.topic)
+                return
             metric = parts[3]
             value = msg.payload.decode("utf-8", errors="replace")
             self.handle_update(car_id, metric, value)
@@ -292,6 +393,7 @@ class GarageDoorService:
 
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
         client.on_message = on_message
 
         log.info("mqtt_connecting", host=mqtt_host, port=mqtt_port)
@@ -311,6 +413,8 @@ class GarageDoorService:
             pass
         finally:
             log.info("shutting_down")
+            if self.heartbeat_handle:
+                self.heartbeat_handle.cancel()
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
             if self.meross_manager:
