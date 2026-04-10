@@ -6,11 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from garage_door import (
-    CAR_IDS,
     HOME_GEOFENCE,
     HOME_LAT,
     HOME_LON,
-    OPEN_DISTANCE_M,
     CarState,
     GarageDoorService,
     haversine_m,

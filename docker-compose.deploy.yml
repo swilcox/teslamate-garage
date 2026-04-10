@@ -1,7 +1,7 @@
 services:
   teslamate-garage:
-    image: teslamate-garage:dev
-    build: .
+    image: ghcr.io/swilcox/teslamate-garage:latest
+    pull_policy: always
     env_file: .env
     network_mode: host
     restart: unless-stopped

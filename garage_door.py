@@ -14,12 +14,15 @@ Usage:
 """
 
 import asyncio
+import importlib.metadata
 import logging
 import math
 import os
 import sys
 import time
+import tomllib
 from dataclasses import dataclass
+from pathlib import Path
 
 import paho.mqtt.client as mqtt
 import structlog
@@ -49,6 +52,30 @@ logging.getLogger("meross_iot").setLevel(logging.WARNING)
 logging.getLogger("paho").setLevel(logging.WARNING)
 
 log = structlog.get_logger()
+PROJECT_NAME = "teslamate-garage"
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def get_version() -> str:
+    """Return the project version from installed metadata or pyproject.toml."""
+    env_version = os.environ.get("APP_VERSION")
+    if env_version:
+        return env_version
+
+    try:
+        return importlib.metadata.version(PROJECT_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        pyproject_path = PROJECT_ROOT / "pyproject.toml"
+        if pyproject_path.exists():
+            with pyproject_path.open("rb") as f:
+                project = tomllib.load(f).get("project", {})
+            version = project.get("version")
+            if version:
+                return version
+    return "0.0.0+unknown"
+
+
+APP_VERSION = get_version()
 
 
 def load_env():
@@ -425,6 +452,7 @@ class GarageDoorService:
 
 
 def main():
+    log.info("service_starting", version=APP_VERSION, python=sys.version.split()[0])
     service = GarageDoorService()
     try:
         asyncio.run(service.run())
