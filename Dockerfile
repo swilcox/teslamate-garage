@@ -5,10 +5,13 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 ARG APP_VERSION=0.0.0+unknown
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
+ARG REPO_URL=https://github.com/swilcox/teslamate-garage
 
 LABEL org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.revision=$VCS_REF \
-      org.opencontainers.image.created=$BUILD_DATE
+      org.opencontainers.image.created=$BUILD_DATE \
+      org.opencontainers.image.source=$REPO_URL \
+      org.opencontainers.image.licenses=MIT
 
 WORKDIR /app
 

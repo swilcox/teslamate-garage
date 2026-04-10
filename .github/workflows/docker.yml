@@ -64,6 +64,7 @@ jobs:
             type=sha,format=short
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -77,3 +78,4 @@ jobs:
             APP_VERSION=${{ steps.version.outputs.version }}
             VCS_REF=${{ github.event.workflow_run.head_sha }}
             BUILD_DATE=${{ github.event.workflow_run.created_at }}
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
