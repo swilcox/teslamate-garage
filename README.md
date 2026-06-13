@@ -12,6 +12,7 @@ Automatically opens and closes a Meross smart garage door based on Tesla vehicle
 - **Open**: Subscribes to TeslaMate MQTT lat/lon updates. When a vehicle in Drive enters within 200m of home, the garage door opens via the Meross cloud API.
 - **Close**: When a vehicle's TeslaMate geofence changes away from "Home", the door closes (with a safety check that no other vehicle is in Drive/Reverse at home).
 - **Cooldowns**: After opening, a 2-minute cooldown prevents re-triggering. After closing, a 5-minute cooldown prevents the door from reopening if the car lingers nearby.
+- **Connection watchdog**: A periodic heartbeat verifies the MQTT connection is alive. If it drops, the service forces a reconnect; if it stays down past `MQTT_WATCHDOG_TIMEOUT`, the process exits so the container restart policy brings it back fresh. This recovers from wedged connections (broker restarts, NAT idle-timeouts, zombie sockets) that previously required a manual container restart.
 
 ## Requirements
 
@@ -61,6 +62,7 @@ Supported `.env` settings:
 | `OPEN_COOLDOWN` | `120` | Minimum seconds between open actions. |
 | `CLOSE_COOLDOWN` | `300` | Minimum seconds after a close before opening is allowed again. |
 | `HEARTBEAT_INTERVAL` | `300` | Seconds between heartbeat status logs and MQTT staleness checks. |
+| `MQTT_WATCHDOG_TIMEOUT` | `600` | Seconds the MQTT connection may stay down before the process exits for a container restart. The check runs each heartbeat, so the effective timing is rounded up to the next `HEARTBEAT_INTERVAL` tick. Set to `0` to disable the self-restart and keep only reconnect attempts. |
 
 ## Usage
 
