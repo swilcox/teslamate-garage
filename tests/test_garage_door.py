@@ -285,3 +285,98 @@ class TestCloseDoorSafety:
         service.garage_device.get_is_open = MagicMock(return_value=False)
         await service.close_door("test")
         service.garage_device.async_close.assert_not_called()
+
+
+# --- GarageDoorService.check_mqtt_health (connection watchdog) ---
+
+
+class TestCheckMqttHealth:
+    def setup_method(self):
+        self.service = GarageDoorService()
+        self.client = MagicMock()
+        self.service.mqtt_client = self.client
+
+    def test_no_client_is_noop(self):
+        self.service.mqtt_client = None
+        # Should not raise even though there is no client.
+        self.service.check_mqtt_health(time.time())
+
+    def test_connected_clears_down_state(self):
+        self.client.is_connected.return_value = True
+        self.service.mqtt_down_since = time.time() - 30
+
+        self.service.check_mqtt_health(time.time())
+
+        assert self.service.mqtt_down_since is None
+        self.client.reconnect.assert_not_called()
+
+    def test_connected_stays_clear(self):
+        self.client.is_connected.return_value = True
+        self.service.mqtt_down_since = None
+
+        self.service.check_mqtt_health(time.time())
+
+        assert self.service.mqtt_down_since is None
+        self.client.reconnect.assert_not_called()
+
+    def test_down_first_time_records_and_reconnects(self):
+        self.client.is_connected.return_value = False
+        self.service.mqtt_down_since = None
+        now = time.time()
+
+        with patch("garage_door.MQTT_WATCHDOG_TIMEOUT", 600):
+            self.service.check_mqtt_health(now)
+
+        # Marks the start of the outage and nudges a reconnect.
+        assert self.service.mqtt_down_since == now
+        self.client.reconnect.assert_called_once()
+
+    def test_down_under_timeout_reconnects_without_exit(self):
+        self.client.is_connected.return_value = False
+        now = time.time()
+        self.service.mqtt_down_since = now - 60  # well under the 600s timeout
+
+        with patch("garage_door.MQTT_WATCHDOG_TIMEOUT", 600), \
+                patch("garage_door.os._exit") as mock_exit:
+            self.service.check_mqtt_health(now)
+
+        mock_exit.assert_not_called()
+        self.client.reconnect.assert_called_once()
+
+    def test_watchdog_exits_after_timeout(self):
+        self.client.is_connected.return_value = False
+        now = time.time()
+        self.service.mqtt_down_since = now - 601  # just past the 600s timeout
+
+        with patch("garage_door.MQTT_WATCHDOG_TIMEOUT", 600), \
+                patch("garage_door.os._exit") as mock_exit:
+            self.service.check_mqtt_health(now)
+
+        mock_exit.assert_called_once_with(1)
+        # We exit instead of attempting another reconnect.
+        self.client.reconnect.assert_not_called()
+
+    def test_watchdog_disabled_when_timeout_zero(self):
+        self.client.is_connected.return_value = False
+        now = time.time()
+        self.service.mqtt_down_since = now - 100_000  # very stale
+
+        with patch("garage_door.MQTT_WATCHDOG_TIMEOUT", 0), \
+                patch("garage_door.os._exit") as mock_exit:
+            self.service.check_mqtt_health(now)
+
+        # Timeout of 0 disables the self-restart; we just keep reconnecting.
+        mock_exit.assert_not_called()
+        self.client.reconnect.assert_called_once()
+
+    def test_reconnect_exception_is_swallowed(self):
+        self.client.is_connected.return_value = False
+        self.client.reconnect.side_effect = OSError("connection refused")
+        now = time.time()
+        self.service.mqtt_down_since = now - 60
+
+        with patch("garage_door.MQTT_WATCHDOG_TIMEOUT", 600):
+            # A failing reconnect must not crash the heartbeat.
+            self.service.check_mqtt_health(now)
+
+        self.client.reconnect.assert_called_once()

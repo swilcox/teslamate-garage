@@ -99,6 +99,9 @@ HOME_LON = float(os.environ.get("HOME_LON", "-122.1501"))
 OPEN_DISTANCE_M = float(os.environ.get("OPEN_DISTANCE_M", "200"))
 OPEN_COOLDOWN = int(os.environ.get("OPEN_COOLDOWN", "120"))
 CLOSE_COOLDOWN = int(os.environ.get("CLOSE_COOLDOWN", "300"))
+# If the MQTT connection stays down longer than this (seconds), exit so the
+# container's restart policy gives us a fresh process. Set to 0 to disable.
+MQTT_WATCHDOG_TIMEOUT = int(os.environ.get("MQTT_WATCHDOG_TIMEOUT", "600"))
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -174,6 +177,11 @@ class GarageDoorService:
 
         # Track last MQTT message time per car for staleness detection
         self.last_mqtt_time: dict[int, float] = {cid: 0.0 for cid in CAR_IDS}
+
+        # MQTT client + connection watchdog state. mqtt_down_since is the
+        # timestamp the connection went (or was found) down; None means up.
+        self.mqtt_client: mqtt.Client | None = None
+        self.mqtt_down_since: float | None = None
 
     async def connect_meross(self):
         email = os.environ.get("MEROSS_EMAIL")
@@ -348,7 +356,10 @@ class GarageDoorService:
         """Periodic status dump so we can tell the service is alive and data is flowing."""
         self.log_car_states(event="heartbeat")
 
-        # Warn if any car hasn't sent data recently
+        # Warn if any car hasn't sent data recently. Note: a car that is parked
+        # and asleep legitimately stops publishing, so stale data alone is not
+        # proof of a broken connection — the watchdog below uses the actual
+        # MQTT connection state for that.
         now = time.time()
         for cid in CAR_IDS:
             last = self.last_mqtt_time[cid]
@@ -356,10 +367,52 @@ class GarageDoorService:
                 log.warning("mqtt_data_stale", car=cid,
                             seconds_since_last=round(now - last))
 
+        self.check_mqtt_health(now)
+
         # Schedule next heartbeat
         if self.loop:
             self.heartbeat_handle = self.loop.call_later(
                 self.heartbeat_interval, self.heartbeat)
+
+    def check_mqtt_health(self, now: float):
+        """Recover the MQTT connection if it has dropped.
+
+        paho's loop_start() has built-in auto-reconnect, but it can get wedged
+        (zombie socket, broker restart, NAT idle timeout) and never recover. We
+        nudge it with an explicit reconnect, and if the connection stays down
+        past MQTT_WATCHDOG_TIMEOUT we exit so the container restart policy gives
+        us a clean process — the automated version of a manual restart.
+        """
+        client = self.mqtt_client
+        if client is None:
+            return
+
+        if client.is_connected():
+            if self.mqtt_down_since is not None:
+                log.info("mqtt_reconnected",
+                         down_for_s=round(now - self.mqtt_down_since))
+            self.mqtt_down_since = None
+            return
+
+        # Connection is down.
+        if self.mqtt_down_since is None:
+            self.mqtt_down_since = now
+        down_for = now - self.mqtt_down_since
+        log.warning("mqtt_connection_down", down_for_s=round(down_for))
+
+        if MQTT_WATCHDOG_TIMEOUT and down_for >= MQTT_WATCHDOG_TIMEOUT:
+            log.error("mqtt_watchdog_restart",
+                      down_for_s=round(down_for),
+                      timeout_s=MQTT_WATCHDOG_TIMEOUT)
+            # Hard exit; the container's restart policy brings us back fresh.
+            os._exit(1)
+            return  # pragma: no cover - os._exit does not return
+
+        try:
+            client.reconnect()
+            log.info("mqtt_reconnect_requested")
+        except Exception as exc:
+            log.warning("mqtt_reconnect_failed", error=str(exc))
 
     def mark_initialized(self):
         """Called after a short delay to mark retained messages as processed."""
@@ -393,14 +446,20 @@ class GarageDoorService:
                 return
             mqtt_host = os.environ.get("MQTT_HOST", "localhost")
             log.info("mqtt_connected", host=mqtt_host)
+            self.mqtt_down_since = None
             for car_id in CAR_IDS:
                 for topic in topics:
                     client.subscribe(f"teslamate/cars/{car_id}/{topic}")
-            # After retained messages arrive (give it 3 seconds), mark as initialized
-            self.init_timer = self.loop.call_later(3.0, self.mark_initialized)
+            # After retained messages arrive (give it 3 seconds), mark as
+            # initialized. Only on the first connect — on a reconnect we must
+            # keep our existing state rather than re-baselining near-home.
+            if not self.initialized:
+                self.init_timer = self.loop.call_later(3.0, self.mark_initialized)
 
         def on_disconnect(client, userdata, flags, reason_code, properties):
             log.warning("mqtt_disconnected", reason_code=reason_code)
+            if self.mqtt_down_since is None:
+                self.mqtt_down_since = time.time()
 
         def on_message(client, userdata, msg):
             parts = msg.topic.split("/")
@@ -426,6 +485,7 @@ class GarageDoorService:
         log.info("mqtt_connecting", host=mqtt_host, port=mqtt_port)
         client.connect(mqtt_host, mqtt_port, keepalive=60)
         client.loop_start()
+        self.mqtt_client = client
         return client
 
     async def run(self):
